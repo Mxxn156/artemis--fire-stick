@@ -1,0 +1,154 @@
+--- a/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
++++ b/app/src/main/java/com/limelight/binding/video/MediaCodecDecoderRenderer.java
+@@ -1,6 +1,8 @@
+ package com.limelight.binding.video;
+
++import com.limelight.binding.video.FireTVHelper;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ // ... (other existing imports unchanged)
+
++// ============================================================
++// FIRE TV TUNNELING PATCH
++// Apply on top of ClassicOldSong/moonlight-android moonlight-noir branch
++// ============================================================
+
+ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements Choreographer.FrameCallback {
+
+     private static final boolean USE_FRAME_RENDER_TIME = false;
+     private static final boolean FRAME_RENDER_TIME_ONLY = USE_FRAME_RENDER_TIME && false;
+
++    // Fire TV: tracks whether we successfully configured tunneled playback
++    private boolean tunneledPlaybackActive = false;
++    // Fire TV: audio session ID for A/V sync tunneling (-1 = video-only on Android 11+)
++    private int tunnelingAudioSessionId = -1;
+
+     // ---- CHANGE 1 of 4: findAv1Decoder ----------------------------------------
+     // Original code only uses AV1 when FormatOption.FORCE_AV1 is set.
+     // On Fire TV hardware with MT8695/MT8696, AV1 has a 100 Mbps hardware ceiling
+     // vs 35 Mbps for HEVC, so we promote it automatically.
+-    private MediaCodecInfo findAv1Decoder(PreferenceConfiguration prefs) {
+-        // For now, don't use AV1 unless explicitly requested
+-        if (prefs.videoFormat != PreferenceConfiguration.FormatOption.FORCE_AV1) {
+-            return null;
+-        }
++    private MediaCodecInfo findAv1Decoder(PreferenceConfiguration prefs) {
++        // On Fire TV MediaTek hardware: promote AV1 automatically if available,
++        // since it has a much higher hardware bitrate ceiling than HEVC.
++        boolean forceAv1 = prefs.videoFormat == PreferenceConfiguration.FormatOption.FORCE_AV1;
++        boolean autoPromote = FireTVHelper.shouldPromoteAv1OverHevc();
++
++        if (!forceAv1 && !autoPromote) {
++            return null;
++        }
+
+         MediaCodecInfo decoderInfo = MediaCodecHelper.findProbableSafeDecoder("video/av01", -1);
+
+         if (decoderInfo != null) {
+             if (!MediaCodecHelper.isDecoderWhitelistedForAv1(decoderInfo)) {
+                 LimeLog.info("Found AV1 decoder, but it's not whitelisted - "+decoderInfo.getName());
+
+-                if (prefs.videoFormat == PreferenceConfiguration.FormatOption.FORCE_AV1) {
++                if (forceAv1 || autoPromote) {
+                     LimeLog.info("Forcing AV1 enabled despite non-whitelisted decoder");
+                 }
+                 else if (hevcDecoder != null && decoderCanMeetPerformancePointWithAv1AndNotHevc(decoderInfo, hevcDecoder, prefs)) {
+@@ -1,0 +1,0 @@
+     // ---- CHANGE 2 of 4: initializeDecoder — add tunneling setup --------------------
+     // After the decoder loop (the tryNumber loop) succeeds, attempt to configure
+     // tunneled playback on Fire TV. This is done BEFORE videoDecoder.start().
+     //
+     // The key difference from standard Moonlight: on tunneled playback we do NOT
+     // call releaseOutputBuffer(index, renderTimestampNs) for timing — instead we
+     // set the presentation timestamp in queueInputBuffer and let the hardware
+     // handle it. This eliminates a full Choreographer round-trip per frame.
+
+     public int initializeDecoder(boolean throwOnCodecError) {
+         // ... (existing codec selection logic unchanged) ...
+
+         for (int tryNumber = 0;; tryNumber++) {
+             LimeLog.info("Decoder configuration try: "+tryNumber);
+             MediaFormat mediaFormat = createBaseMediaFormat(mimeType);
+
++            // Fire TV: attempt to configure tunneled playback
++            if (FireTVHelper.IS_FIRE_TV && selectedDecoderInfo != null) {
++                boolean tunnelConfigured = FireTVHelper.configureTunneledPlayback(
++                    mediaFormat, tunnelingAudioSessionId);
++                if (tunnelConfigured) {
++                    LimeLog.info("FireTV: configured tunneled playback in MediaFormat");
++                } else {
++                    LimeLog.info("FireTV: tunneled playback not available for this decoder/OS");
++                }
++            }
+
+             boolean newFormat = MediaCodecHelper.setDecoderLowLatencyOptions(mediaFormat, selectedDecoderInfo, tryNumber);
+
+             if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, !newFormat && throwOnCodecError)) {
++                // Check if tunneling was actually accepted by the codec
++                if (FireTVHelper.IS_FIRE_TV) {
++                    try {
++                        MediaCodecInfo.CodecCapabilities actualCaps =
++                            selectedDecoderInfo.getCapabilitiesForType(mimeType);
++                        tunneledPlaybackActive = actualCaps != null &&
++                            actualCaps.isFeatureSupported(
++                                MediaCodecInfo.CodecCapabilities.FEATURE_TunneledPlayback);
++                        if (tunneledPlaybackActive) {
++                            LimeLog.info("FireTV: tunneled playback ACTIVE — bypassing Choreographer render loop");
++                        } else {
++                            LimeLog.info("FireTV: tunneled playback NOT active, using standard render path");
++                        }
++                    } catch (Exception e) {
++                        tunneledPlaybackActive = false;
++                    }
++                }
+                 break;
+             }
+             // ... rest of loop unchanged ...
+         }
+         return 0;
+     }
+
+     // ---- CHANGE 3 of 4: rendererThread — set THREAD_PRIORITY_DISPLAY on Fire TV ----
+     // The render thread starts in VideoDecoderRenderer. We intercept it here.
++    @Override
++    public void start() {
++        if (FireTVHelper.IS_FIRE_TV) {
++            // Elevate the decoder thread priority before starting the render loop
++            FireTVHelper.setDecoderThreadPriority();
++        }
++        super.start();
++    }
+
+     // ---- CHANGE 4 of 4: doFrame — skip Choreographer render path on tunneling ------
+     // When tunneled playback is active, the hardware handles vsync-aligned rendering.
+     // We must NOT call releaseOutputBuffer with a render timestamp — instead we just
+     // release the buffer immediately and let the tunnel do its work.
+
+     @Override
+     public void doFrame(long frameTimeNanos) {
+         if (stopping) return;
+
++        // Fire TV tunneled playback: the hardware decoder handles frame pacing
++        // internally. We just drain the output queue as fast as possible.
++        if (tunneledPlaybackActive) {
++            Integer nextOutputBuffer = outputBufferQueue.poll();
++            if (nextOutputBuffer != null) {
++                try {
++                    // Release immediately — tunneled decoder handles display timing
++                    videoDecoder.releaseOutputBuffer(nextOutputBuffer, true);
++                } catch (IllegalStateException e) {
++                    handleDecoderException(e);
++                }
++                if (doCodecRecoveryIfRequired(CR_FLAG_CHOREOGRAPHER)) return;
++            }
++            Choreographer.getInstance().postFrameCallback(this);
++            return;
++        }
++        // Non-tunneled path: original Choreographer-timed render logic below
++        // ... (all existing doFrame logic unchanged) ...
+
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+             frameTimeNanos -= activity.getWindowManager().getDefaultDisplay().getAppVsyncOffsetNanos();
+         }
+         // ... rest of original doFrame ...
+     }

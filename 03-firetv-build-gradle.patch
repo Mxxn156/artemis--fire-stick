@@ -1,0 +1,56 @@
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -1,0 +1,0 @@
++// ============================================================
++// FIRE TV BUILD FLAVOR PATCH
++// Adds 'firetv' product flavor with lean mode + Oboe audio
++// ============================================================
+
+ android {
+     // ... (existing compileSdkVersion, buildToolsVersion, etc. unchanged) ...
+
+     defaultConfig {
+         // ... unchanged ...
+     }
+
++    flavorDimensions "target"
++
++    productFlavors {
++        standard {
++            dimension "target"
++            // No changes: identical to upstream Artemis build
++        }
++
++        firetv {
++            dimension "target"
++            applicationIdSuffix ".firetv"
++            versionNameSuffix "-firetv"
++
++            // Enable lean TV mode: removes virtual gamepad renderer,
++            // touch input handling, SBS 3D, portrait mode, etc.
++            buildConfigField "boolean", "LEAN_TV_MODE", "true"
++
++            // Enable tunneled playback attempt on Fire OS
++            buildConfigField "boolean", "ENABLE_TUNNELED_PLAYBACK", "true"
++
++            // Enable Oboe low-latency audio
++            buildConfigField "boolean", "ENABLE_OBOE_AUDIO", "true"
++
++            // Target Fire TV's Android TV launcher
++            manifestPlaceholders = [
++                "firetvBannerIcon": "@drawable/banner_firetv"
++            ]
++        }
++    }
+
+     buildTypes {
+         // ... unchanged ...
+     }
+ }
+
+ dependencies {
+     // ... existing dependencies unchanged ...
+
++    // Oboe for low-latency audio on Fire TV (firetv flavor only)
++    firetvImplementation 'com.google.oboe:oboe:1.8.0'
+ }
