@@ -1,0 +1,168 @@
+name: Build Artemis FireStick APK
+
+on:
+  push:
+    branches: [ "moonlight-noir" ]
+  pull_request:
+    branches: [ "moonlight-noir" ]
+  workflow_dispatch:  # permite rodar manualmente pelo GitHub UI
+
+jobs:
+  build:
+    name: Build FireTV APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # --------------------------------------------------------
+      # 1. Checkout com todos os submodules (moonlight-common-c, etc.)
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # --------------------------------------------------------
+      # 2. Java 17 (exigido pelo Android Gradle Plugin moderno)
+      # --------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # --------------------------------------------------------
+      # 3. Android SDK — instala só os componentes necessários
+      # --------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --update
+          sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;25.2.9519653" \
+            "cmake;3.22.1"
+
+      # --------------------------------------------------------
+      # 4. Cache do NDK e Gradle para builds mais rápidos
+      # --------------------------------------------------------
+      - name: Cache NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk
+          key: ndk-25.2.9519653
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      # --------------------------------------------------------
+      # 5. Escreve o local.properties com o caminho do NDK
+      # --------------------------------------------------------
+      - name: Write local.properties
+        run: |
+          echo "ndk.dir=$ANDROID_HOME/ndk/25.2.9519653" > local.properties
+          echo "sdk.dir=$ANDROID_HOME" >> local.properties
+
+      # --------------------------------------------------------
+      # 6. Permissão de execução no gradlew
+      # --------------------------------------------------------
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # --------------------------------------------------------
+      # 7. Build — gera o APK de release não assinado (unsigned)
+      #    Troque 'assembleRelease' por 'assembleFiretvRelease'
+      #    depois de aplicar o patch do build.gradle com o flavor firetv.
+      #    Por enquanto usa o release padrão para garantir que compila.
+      # --------------------------------------------------------
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.jvmargs=-Xmx4g"
+
+      # --------------------------------------------------------
+      # 8. Assina o APK com uma chave gerada automaticamente
+      #    (debug keystore — suficiente para instalar via ADB/sideload)
+      # --------------------------------------------------------
+      - name: Sign APK (debug keystore)
+        run: |
+          # Gera um keystore temporário se não houver um nos secrets
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "Usando debug keystore gerado automaticamente"
+            keytool -genkeypair -v \
+              -keystore /tmp/debug.keystore \
+              -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=Artemis FireStick, O=Fork, C=BR"
+
+            $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+              --ks /tmp/debug.keystore \
+              --ks-key-alias androiddebugkey \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              --out app/build/outputs/apk/release/artemis-firestick-signed.apk \
+              app/build/outputs/apk/release/*-release-unsigned.apk
+          else
+            echo "Usando keystore dos secrets do repositório"
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > /tmp/release.keystore
+            $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+              --ks /tmp/release.keystore \
+              --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+              --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+              --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
+              --out app/build/outputs/apk/release/artemis-firestick-signed.apk \
+              app/build/outputs/apk/release/*-release-unsigned.apk
+          fi
+
+      # --------------------------------------------------------
+      # 9. Publica o APK como artifact para download direto
+      # --------------------------------------------------------
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artemis-firestick-apk
+          path: app/build/outputs/apk/release/artemis-firestick-signed.apk
+          retention-days: 30
+
+      # --------------------------------------------------------
+      # 10. Cria uma GitHub Release automaticamente em pushes de tag
+      #     Ex: git tag v1.0.0-firetv && git push --tags
+      # --------------------------------------------------------
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/artemis-firestick-signed.apk
+          name: "Artemis FireStick ${{ github.ref_name }}"
+          body: |
+            ## Artemis FireStick Edition — ${{ github.ref_name }}
+
+            Fork de [ClassicOldSong/moonlight-android](https://github.com/ClassicOldSong/moonlight-android)
+            otimizado para mínima latência de codificação em Fire Stick / Fire OS.
+
+            ### Otimizações incluídas
+            - Tunneled playback (MediaTek MT8695/MT8696)
+            - Prioridade de thread THREAD_PRIORITY_DISPLAY
+            - Promoção automática de AV1 em hardware Fire TV
+            - Caps de bitrate por codec para evitar overflow do decoder
+
+            ### Instalação
+            1. Ative "Apps de fontes desconhecidas" nas configurações do Fire Stick
+            2. Use o Downloader app para baixar e instalar o APK
+            3. Ou instale via ADB: `adb install artemis-firestick-signed.apk`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
